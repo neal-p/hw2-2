@@ -19,6 +19,7 @@ int NUM_PROCS;
 std::vector<particle_t> PARTS;
 std::vector<particle_t> GHOSTS;
 float CUTOFF = cutoff;
+int STEP;
 
 bool is_overlapping(float* a_bounds, float* b_bounds) {
 
@@ -101,6 +102,7 @@ void init_simulation(particle_t* parts, int num_parts, double size, int rank, in
 	
         NUM_PROCS = num_procs;	
 	MAX_DEPTH = std::log2(num_procs);
+	STEP = 0;
 
 #ifdef DEBUG
 	if (rank == 0) {
@@ -243,9 +245,47 @@ void init_simulation(particle_t* parts, int num_parts, double size, int rank, in
 
      #endif         
 
+     // Get ghosts in the halo region
+     int other_n;
+     int my_n = PARTS.size();
 
+
+     for (int relevant_rank : relevant_ranks) {
+
+	  #ifdef DEBUG
+		      std::cout << "Rank " << rank << " will try to communicate with " << relevant_rank << "\n";
+          #endif
+	
+
+
+	    MPI_Sendrecv(&my_n, 1, MPI_INT,
+			    relevant_rank, 0,
+			    &other_n, 1, MPI_INT,
+			    relevant_rank, 0, MPI_COMM_WORLD, &status);
+
+
+            #ifdef DEBUG
+	        std::cout << "Rank " << rank << " will need to recieve " << other_n << " ghosts from " << relevant_rank << "\n";
+            #endif
+
+
+	    // Make enough room	
+	    int current_n_ghosts = GHOSTS.size();
+	    GHOSTS.resize(current_n_ghosts + other_n);
+
+
+	    MPI_Sendrecv(PARTS.data(), PARTS.size(), PARTICLE,
+			    relevant_rank, 0,
+			    &GHOSTS[current_n_ghosts], other_n, PARTICLE,
+			    relevant_rank, 0, MPI_COMM_WORLD, &status);
+
+            #ifdef DEBUG
+	    for (particle_t p : GHOSTS) {
+		    std::cout << "Rank " << rank << " got ghost Pid " << p.id << "\n";
+	    }
+            #endif
+     }
      
-
 
       MPI_Barrier(MPI_COMM_WORLD);
 }
