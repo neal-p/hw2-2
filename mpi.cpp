@@ -112,6 +112,17 @@ void init_simulation(particle_t* parts, int num_parts, double size, int rank, in
         // Assigns areas of the simulation
 	// to each rank with recursive bisection	
 	PARTS.assign(parts, parts + num_parts);
+
+	if (rank == 0) {
+		std::cout << "Initial Particle Locations:\n";
+		for (particle_t p : PARTS) {
+			std::cout << "\tPid: " << p.id << " x: " << p.x << " y: " << p.y << "\n";
+		}
+	}
+
+	MPI_Barrier(MPI_COMM_WORLD);
+
+
 	recursive_bisect(rank, 0);
 
 	float x_max = std::max_element(PARTS.begin(),
@@ -213,6 +224,8 @@ void init_simulation(particle_t* parts, int num_parts, double size, int rank, in
 	    if (is_overlapping(my_bounds, other_bounds)) {
 		    relevant_ranks.push_back(data_source);
             }
+
+	    data_source = (data_source -1 + NUM_PROCS) % NUM_PROCS;
     }
     
      #ifdef DEBUG
