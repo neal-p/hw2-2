@@ -6,7 +6,7 @@
 #include <vector>
 
 
-#define DEBUG 1
+#define DEBUG 0
 
 #ifdef DEBUG
 #include <iostream>
@@ -190,7 +190,8 @@ void init_simulation(particle_t* parts, int num_parts, double size, int rank, in
 	if (rank == 0) {
 		std::cout << "Initial Particle Locations:\n";
 		for (particle_t p : PARTS) {
-			std::cout << "\tPid: " << p.id << " x: " << p.x << " y: " << p.y << "\n";
+			std::cout << "\tPid: " << p.id << " x: " << p.x << " y: " << p.y << "\n"
+				  << "\t vx: " << p.vx << " vy: " << p.vy << "\n";
 		}
 	}
         #endif
@@ -199,6 +200,12 @@ void init_simulation(particle_t* parts, int num_parts, double size, int rank, in
 }
 
 void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, int num_procs) {
+
+        #if DEBUG >= 1 
+	if (rank == 0) {
+	    std::cout << "STEP: " << STEP << "\n";
+	}
+        #endif
 
 	if (STEP % 5 == 0) {
 	    MPI_Allreduce(&NEED_TO_REDISTRIBUTE, &GLOBAL_NEED_TO_REDISTRIBUTE, 1, MPI_C_BOOL, MPI_LOR, MPI_COMM_WORLD);
@@ -270,6 +277,7 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
 	    }
 	}
 
+
     #endif
 
     // Communicate the bounds 
@@ -283,7 +291,7 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
     int data_source = recv_from;
 
 
-     #if (DEBUG >= 2)
+     #if (DEBUG >= 5)
 
             for (int i=0; i < NUM_PROCS; ++i) {
 	        MPI_Barrier(MPI_COMM_WORLD);
@@ -298,7 +306,7 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
     for (int ring_count=0; ring_count < NUM_PROCS-1; ring_count++){
 
 
-            #if (DEBUG >= 2)
+            #if (DEBUG >= 5)
             for (int i=0; i < NUM_PROCS; ++i) {
 	        MPI_Barrier(MPI_COMM_WORLD);
 	        if (i == rank) {
@@ -327,8 +335,10 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
 
 	    data_source = (data_source -1 + NUM_PROCS) % NUM_PROCS;
     }
+
+    std::sort(RELEVANT_RANKS.begin(), RELEVANT_RANKS.end());
     
-     #if (DEBUG >= 1)
+     #if (DEBUG >= 5)
      for (int i=0; i < NUM_PROCS; ++i) {
 	  MPI_Barrier(MPI_COMM_WORLD);
 	  if (i == rank) {
@@ -371,7 +381,7 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
 			    relevant_rank, 0, MPI_COMM_WORLD, &status);
 
 
-            #if (DEBUG >= 1)
+            #if (DEBUG >= 5)
 	        std::cout << "Rank " << rank << " will need to recieve " << other_n << " ghosts from " << relevant_rank << "\n";
             #endif
 
@@ -386,7 +396,7 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
 			    &GHOSTS[current_n_ghosts], other_n, PARTICLE,
 			    relevant_rank, 0, MPI_COMM_WORLD, &status);
 
-            #if (DEBUG >= 2)
+            #if (DEBUG >= 5)
 	    for (particle_t p : GHOSTS) {
 		    std::cout << "Rank " << rank << " got ghost Pid " << p.id << "\n";
 	    }
@@ -436,19 +446,41 @@ void gather_for_save(particle_t* parts, int num_parts, double size, int rank, in
     // processor has an in-order view of all particles. That is, the array
     // parts is complete and sorted by particle id.
 
-	// Place to recieve all parts
-	// only actually allocate space on rank0
-	std::vector<particle_t> recv;
+	std::vector<int> counts;
+	std::vector<int> displacements;
+	int my_count = PARTS.size();
+
 	if (rank == 0) {
-		recv.resize(num_parts);
+		counts.resize(num_procs);
+		displacements.resize(num_procs);
 	}
 
-	MPI_Gather(PARTS.data(), PARTS.size(), PARTICLE,
-		   recv.data(), num_parts, PARTICLE, 
-		   0, MPI_COMM_WORLD
-			);
+	MPI_Gather(&my_count, 1, MPI_INT, counts.data(),
+			1, MPI_INT, 0, MPI_COMM_WORLD);
 
-	for (particle_t p : recv) { 
-		parts[p.id - 1] = p;
+	if (rank == 0) {
+
+		displacements[0] = 0;
+		for (int i=1; i < num_procs; i++) {
+			displacements[i] = displacements[i-1] + counts[i-1];
+		}
+
+		int total_count = displacements[num_procs-1] + counts[num_procs-1];
+		std::cout << "total count: " << total_count << " compared to num particles: " << num_parts << "\n";
+
+		for (int i=0; i < num_procs; i++) {
+			std::cout << "rank " << i << " count: " << counts[i] << ", disp: " << displacements[i] << "\n";
+		}
 	}
+
+	std::vector<particle_t> recv(num_parts);
+	MPI_Gatherv(PARTS.data(), PARTS.size(), PARTICLE,
+			recv.data(), counts.data(), displacements.data(), PARTICLE, 0, MPI_COMM_WORLD);
+
+	for (particle_t& p : recv) {
+		std::cout << "copying from gathered: Pid " << p.id << "\n";
+		parts[p.id -1] = p;
+	}
+
+	MPI_Barrier(MPI_COMM_WORLD);
 }
