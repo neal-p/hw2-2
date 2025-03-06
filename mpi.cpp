@@ -445,42 +445,40 @@ void gather_for_save(particle_t* parts, int num_parts, double size, int rank, in
     // Write this function such that at the end of it, the master (rank == 0)
     // processor has an in-order view of all particles. That is, the array
     // parts is complete and sorted by particle id.
+    
+       
+        // Need to temporarily pad to equal number of parts
+	int parts_per_rank = (num_parts / num_procs) + (num_parts % num_procs);
+	int original_n = PARTS.size();
+	
+	if (original_n < parts_per_rank) {
+		PARTS.resize(parts_per_rank);
 
-	std::vector<int> counts;
-	std::vector<int> displacements;
-	int my_count = PARTS.size();
-
-	if (rank == 0) {
-		counts.resize(num_procs);
-		displacements.resize(num_procs);
-	}
-
-	MPI_Gather(&my_count, 1, MPI_INT, counts.data(),
-			1, MPI_INT, 0, MPI_COMM_WORLD);
-
-	if (rank == 0) {
-
-		displacements[0] = 0;
-		for (int i=1; i < num_procs; i++) {
-			displacements[i] = displacements[i-1] + counts[i-1];
+		for (int i=original_n; i < parts_per_rank; i++) {
+			// Sentinel so that I know this is just padding
+			// on the root rank
+			PARTS[i].id = 0;
 		}
 
-		int total_count = displacements[num_procs-1] + counts[num_procs-1];
-		std::cout << "total count: " << total_count << " compared to num particles: " << num_parts << "\n";
+	} else if (original_n > parts_per_rank) {
+		std::cout << "HEY SOMETHING WRONG!!! Rank " << rank << " original_n: " << original_n << ", parts_per_rank: " << parts_per_rank << "\n";
+	}
 
-		for (int i=0; i < num_procs; i++) {
-			std::cout << "rank " << i << " count: " << counts[i] << ", disp: " << displacements[i] << "\n";
+
+	// only allocate space on root
+	std::vector<particle_t> recv;
+	if (rank == 0) {
+		recv.resize(parts_per_rank * num_procs);
+	}
+
+	MPI_Gather(PARTS.data(), parts_per_rank, PARTICLE,
+			recv.data(), parts_per_rank, PARTICLE,
+			0, MPI_COMM_WORLD);
+
+	if (rank == 0) {
+		for (int i=0; i < num_parts; i++) {
 		}
 	}
-
-	std::vector<particle_t> recv(num_parts);
-	MPI_Gatherv(PARTS.data(), PARTS.size(), PARTICLE,
-			recv.data(), counts.data(), displacements.data(), PARTICLE, 0, MPI_COMM_WORLD);
-
-	for (particle_t& p : recv) {
-		std::cout << "copying from gathered: Pid " << p.id << "\n";
-		parts[p.id -1] = p;
-	}
-
-	MPI_Barrier(MPI_COMM_WORLD);
 }
+
+
