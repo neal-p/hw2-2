@@ -7,7 +7,7 @@
 #include <unordered_map>
 
 
-#define DEBUG 2
+#define DEBUG 3
 
 #ifdef DEBUG
 #include <iostream>
@@ -38,6 +38,15 @@ void apply_force(particle_t& particle, particle_t& neighbor) {
     double coef = (1 - cutoff / r) / r2 / mass;
     particle.ax += coef * dx;
     particle.ay += coef * dy;
+
+    if (particle.ax != particle.ax) {
+	    std::cout << "ax is nan! r2=" << r2 << " r=" << r << " coef=" << coef << "\n";
+    }
+
+    if (particle.ay != particle.ay) {
+	    std::cout << "ay is nan! r2=" << r2 << " r=" << r << " coef=" << coef << "\n";
+    }
+
 }
 
 // Integrate the ODE
@@ -189,7 +198,7 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
 
 		MPI_Irecv(&other_left_count, 1, MPI_INT, 
 				rank-1, 0, MPI_COMM_WORLD, &reqs[req_count++]);
-		MPI_Isend(&my_right_count, 1, MPI_INT,
+		MPI_Isend(&my_left_count, 1, MPI_INT,
 				rank-1, 0, MPI_COMM_WORLD, &reqs[req_count++]);
 	}
 
@@ -197,7 +206,7 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
 
 		MPI_Irecv(&other_right_count, 1, MPI_INT, 
 				rank+1, 0, MPI_COMM_WORLD, &reqs[req_count++]);
-		MPI_Isend(&my_left_count, 1, MPI_INT,
+		MPI_Isend(&my_right_count, 1, MPI_INT,
 				rank+1, 0, MPI_COMM_WORLD, &reqs[req_count++]);
 	}
 
@@ -214,7 +223,7 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
 
 		MPI_Irecv(OTHER_LEFT_GHOSTS.data(), other_left_count, PARTICLE, 
 				rank-1, 0, MPI_COMM_WORLD, &reqs[req_count++]);
-		MPI_Isend(MY_RIGHT_GHOSTS.data(), my_right_count, PARTICLE,
+		MPI_Isend(MY_LEFT_GHOSTS.data(), my_left_count, PARTICLE,
 				rank-1, 0, MPI_COMM_WORLD, &reqs[req_count++]);
 	}
 
@@ -222,7 +231,7 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
 
 		MPI_Irecv(OTHER_RIGHT_GHOSTS.data(), other_right_count, PARTICLE, 
 				rank+1, 0, MPI_COMM_WORLD, &reqs[req_count++]);
-		MPI_Isend(MY_LEFT_GHOSTS.data(), my_left_count, PARTICLE,
+		MPI_Isend(MY_RIGHT_GHOSTS.data(), my_right_count, PARTICLE,
 				rank+1, 0, MPI_COMM_WORLD, &reqs[req_count++]);
 	}
 
@@ -237,6 +246,18 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
 
 #if DEBUG > 1
 	int before = PARTS.size();
+
+	for (int i=0; i < NUM_PROCS; i++) {
+		if (rank == i) {
+                 	for (particle_t& p : PARTS) {
+				if (not_in_my_domain(p)) { 
+					std::cout << "Rank " << rank << " pid " << p.id << " has left domain! x: " << p.x << ", y: " << p.y << " MY_START: " << MY_START << " -> MY_END: " << MY_END << "\n";
+				}
+         	        	
+			}
+		}
+		MPI_Barrier(MPI_COMM_WORLD);
+	}
 #endif
 
 	PARTS.erase(
@@ -245,11 +266,32 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
 				PARTS.end(),
 				not_in_my_domain),
 			PARTS.end());
-#if DEBUG > 1
+#if DEBUG > 2
 	int after = PARTS.size();
 	if (before != after) {
-		std::cout << "Rank " << rank << " removed a particle!\n";
+		std::cout << "Rank " << rank << " removed " << after - before << " particles!\n";
 	}
+
+
+	for (int i=0; i < NUM_PROCS; i++) {
+		if (rank == i) {
+                 	for (particle_t& p : OTHER_LEFT_GHOSTS) {
+				std::cout << "Rank " << rank << " ghost from left - pid: " << p.id << " x=" << p.x << " nimd: " << not_in_my_domain(p) << "\n";
+			}
+
+                 	for (particle_t& p : OTHER_RIGHT_GHOSTS) {
+				std::cout << "Rank " << rank << " ghost from right - pid: " << p.id << " x=" << p.x << " nimd: " << not_in_my_domain(p) << "\n";
+			}
+		}
+
+
+
+
+		MPI_Barrier(MPI_COMM_WORLD);
+	}
+
+
+
 #endif
 
 	// Move from Ghosts to PARTS if it is inside domain
@@ -265,7 +307,9 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
 #if DEBUG > 1
 	after = PARTS.size();
 	if (before != after) {
-		std::cout << "Rank " << rank << " got a particle from the left!\n";
+		for (int i=before; i < after; i++) {
+			std::cout << "Rank " << rank << " got " << PARTS[i].id << " from the left!\n";
+		}
 	}
 
 	before = PARTS.size();
@@ -276,7 +320,9 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
 #if DEBUG > 1
 	after = PARTS.size();
 	if (before != after) {
-		std::cout << "Rank " << rank << " got a particle from the right!\n";
+		for (int i=before; i < after; i++) {
+			std::cout << "Rank " << rank << " got " << PARTS[i].id << " from the left!\n";
+		}
 	}
 
 	before = PARTS.size();
@@ -308,7 +354,10 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
 
 	        // Owned parts interaction	
 		for (particle_t& p_inner : PARTS) {
-			if (p_inner.y > (p_outer.y + CUTOFF)) {
+
+			if (p_outer.id == p_inner.id) {
+				continue;
+			} else if (p_inner.y > (p_outer.y + CUTOFF)) {
 				break;
 			} else if (p_inner.y < (p_outer.y - CUTOFF)) {
 				continue;
@@ -331,7 +380,7 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
 
 
 	        // RIGHT ghosts
-		for (particle_t& p_inner : OTHER_LEFT_GHOSTS) {
+		for (particle_t& p_inner : OTHER_RIGHT_GHOSTS) {
 			if (p_inner.y > (p_outer.y + CUTOFF)) {
 				break;
 			} else if (p_inner.y < (p_outer.y - CUTOFF)) {
