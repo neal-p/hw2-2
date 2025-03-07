@@ -7,7 +7,7 @@
 #include <unordered_map>
 
 
-#define DEBUG 3
+#define DEBUG 0
 
 #ifdef DEBUG
 #include <iostream>
@@ -40,11 +40,11 @@ void apply_force(particle_t& particle, particle_t& neighbor) {
     particle.ay += coef * dy;
 
     if (particle.ax != particle.ax) {
-	    std::cout << "ax is nan! r2=" << r2 << " r=" << r << " coef=" << coef << "\n";
+	    std::cout << "ax is nan! r2=" << r2 << " r=" << r << " coef=" << coef << " a_x: " << particle.x << " a_y: " << particle.y << " b_x: " << neighbor.x << " b_y: " << neighbor.y << "\n";
     }
 
     if (particle.ay != particle.ay) {
-	    std::cout << "ay is nan! r2=" << r2 << " r=" << r << " coef=" << coef << "\n";
+	    std::cout << "ay is nan! r2=" << r2 << " r=" << r << " coef=" << coef << " a_x: " << particle.x << " a_y: " << particle.y << " b_x: " << neighbor.x << " b_y: " << neighbor.y << "\n";
     }
 
 }
@@ -90,18 +90,30 @@ int NUM_PROCS;
 int STEP;
 float CUTOFF;
 float SIZE;
-float DOMAIN_SIZE;
-float MY_START;
-float MY_END;
+int N_CELLS;
+int MY_CELL_START;
+int MY_CELL_END;
 
-std::vector<particle_t> PARTS;
-std::vector<particle_t> MY_LEFT_GHOSTS;
-std::vector<particle_t> MY_RIGHT_GHOSTS;
-std::vector<particle_t> OTHER_LEFT_GHOSTS;
-std::vector<particle_t> OTHER_RIGHT_GHOSTS;
+std::unordered_map<int, std::vector<particle_t>> CELL_TO_PARTS;
+
+
+
+
+void row_col_to_flat(const int row, const int col, int& flat) {
+	flat = (row * N_CELLS) + col;
+}
+
+void flat_to_row_col(const int flat,int& row, int& col) {
+	row = flat / N_CELLS;
+	col = flat % N_CELLS;
+}
+
+
 
 ////////////////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////
+
+
 
 void init_simulation(particle_t* parts, int num_parts, double size, int rank, int num_procs) {
 	// You can use this space to initialize data objects that you may need
@@ -114,6 +126,37 @@ void init_simulation(particle_t* parts, int num_parts, double size, int rank, in
 	CUTOFF = cutoff;
 	SIZE = size;
 
+	// Even grid with cells of size CUTOFFxCUTOFF
+	N_CELLS = SIZE / CUTOFF;
+	if ((float)N_CELLS * CUTOFF < SIZE) {
+		N_CELLS++;
+	}
+
+	// Divide cells among the ranks
+	// would be better to pack in square blocks - revisit later
+	MY_CELL_START = 0;
+	MY_CELL_END = 0;
+	int even_split = (N_CELLS * N_CELLS) / NUM_PROCS;
+	int remainder = (N_CELLS * N_CELLS) % NUM_PROCS;
+
+	for (int i=0; i < NUM_PROCS; i++) {
+		MY_CELL_START = MY_CELL_END;
+		MY_CELL_END = MY_CELL_START + even_split;
+
+		if (i < remainder) {
+			MY_CELL_END ++;
+		}
+
+		if (rank == i) {
+			break;
+		}
+	}
+#if DEBUG > 0
+	if (rank == 0) {
+                std::cout << "Simulation params:\n";
+		std::cout << "SIZE: " << size << ", CUTOFF: " << CUTOFF << ", N_CELLS: " << N_CELLS << "\n";
+	}
+#endif
 
 #if DEBUG > 1
 	if (rank == 0) {
@@ -124,281 +167,126 @@ void init_simulation(particle_t* parts, int num_parts, double size, int rank, in
 				  << "\t\t vx: " << p.vx << " vy: " << p.vy << "\n";
 		}
 	}
+
 #endif
-
-
-        // Split along X dim, one slice per rank
-	DOMAIN_SIZE = std::max(CUTOFF, SIZE / (float)NUM_PROCS);   // if domains get really small, thats going to be an issue
-	MY_START = DOMAIN_SIZE * (float)rank;
-	MY_END = MY_START + DOMAIN_SIZE;
-	
-	// Gather particles in this rank's domain
-	for (int i=0; i < NUM_PARTS; i++) {
-
-		if (parts[i].x >= MY_START && parts[i].x < MY_END) {
-			PARTS.push_back(parts[i]);
-		}
-	}
 
 #if DEBUG > 0
 	for (int i=0; i < NUM_PROCS; i++) {
-		if (i == rank) { 
-			std::cout << "Rank " << rank << " has " << PARTS.size() << " particles:\n";
-			std::cout << "\tstart: " << MY_START << " -> end: " << MY_END << "\n";
-
-			for (particle_t& p : PARTS) {
-				std::cout << "\t\tpid: " << p.id << "\n";
-			}
+		if (rank == i) {
+			std::cout << "Rank " << rank << " will handle cells: " << MY_CELL_START << " -> " << MY_CELL_END << "\n";
 		}
+
 		MPI_Barrier(MPI_COMM_WORLD);
 	}
 #endif
+
+
 
 }
 
 void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, int num_procs) {
 
-	// Check what is near my left border
-	if (rank != 0) {
-		MY_LEFT_GHOSTS.clear();
-		float other_halo = MY_START + CUTOFF;
+	// Assign particles to cells
+	CELL_TO_PARTS.clear();
+	//PARTS_TO_CELL.clear();
 
-		for (particle_t& p : PARTS) {
-			if (p.x <= other_halo) {
-				MY_LEFT_GHOSTS.push_back(p);
-			}
-		}
+	for (int i=0; i < NUM_PARTS; i++) {
+		particle_t& p = parts[i];
+
+		int flat;
+		int col = p.x / CUTOFF;
+		int row = p.y / CUTOFF;
+
+		row_col_to_flat(row, col, flat);
+		CELL_TO_PARTS[flat].push_back(p);
+		//PARTS_TO_CELL[p.id] = flat;
 	}
 
-	// Check what is near my right border
-	if (rank != NUM_PROCS-1) {
-		MY_RIGHT_GHOSTS.clear();
-		float other_halo =  MY_END - CUTOFF;
-
-		for (particle_t& p : PARTS) {
-			if (p.x >= other_halo) {
-				MY_RIGHT_GHOSTS.push_back(p);
-			}
-		}
-	}
+	// Loop over all cells that ths rank is responsible for
+	// calculate forces
+	for (int current_flat=MY_CELL_START; current_flat < MY_CELL_END; current_flat++) {
+		int current_row;
+		int current_col;
 
 
-	MPI_Status status;
-	MPI_Request reqs[4];
-
-	int req_count = 0;
-
-	int other_left_count = 0;
-	int my_right_count = MY_RIGHT_GHOSTS.size();
-
-	int other_right_count = 0;
-	int my_left_count = MY_LEFT_GHOSTS.size();
-
-	if (rank > 0) {
-
-		MPI_Irecv(&other_left_count, 1, MPI_INT, 
-				rank-1, 0, MPI_COMM_WORLD, &reqs[req_count++]);
-		MPI_Isend(&my_left_count, 1, MPI_INT,
-				rank-1, 0, MPI_COMM_WORLD, &reqs[req_count++]);
-	}
-
-	if (rank < NUM_PROCS-1) {
-
-		MPI_Irecv(&other_right_count, 1, MPI_INT, 
-				rank+1, 0, MPI_COMM_WORLD, &reqs[req_count++]);
-		MPI_Isend(&my_right_count, 1, MPI_INT,
-				rank+1, 0, MPI_COMM_WORLD, &reqs[req_count++]);
-	}
-
-
-	MPI_Waitall(req_count, reqs, MPI_STATUSES_IGNORE);
-
-
-	// Allocate space for each other rank
-	OTHER_LEFT_GHOSTS.resize(other_left_count);
-	OTHER_RIGHT_GHOSTS.resize(other_right_count);
-
-
-	if (rank > 0) {
-
-		MPI_Irecv(OTHER_LEFT_GHOSTS.data(), other_left_count, PARTICLE, 
-				rank-1, 0, MPI_COMM_WORLD, &reqs[req_count++]);
-		MPI_Isend(MY_LEFT_GHOSTS.data(), my_left_count, PARTICLE,
-				rank-1, 0, MPI_COMM_WORLD, &reqs[req_count++]);
-	}
-
-	if (rank < NUM_PROCS-1) {
-
-		MPI_Irecv(OTHER_RIGHT_GHOSTS.data(), other_right_count, PARTICLE, 
-				rank+1, 0, MPI_COMM_WORLD, &reqs[req_count++]);
-		MPI_Isend(MY_RIGHT_GHOSTS.data(), my_right_count, PARTICLE,
-				rank+1, 0, MPI_COMM_WORLD, &reqs[req_count++]);
-	}
-
-	MPI_Waitall(req_count, reqs, MPI_STATUSES_IGNORE);
-
-
-	// If any of my particles have gone outside my domain
-	// they will have been passed as ghosts to the proper place
-	// so I should delete them from my domain
-	// and they will be taken up from by the other rank
-	auto not_in_my_domain = [&](const particle_t p){ return p.x < MY_START || p.x >= MY_END;};
-
+		flat_to_row_col(current_flat, current_row, current_col);
 #if DEBUG > 1
-	int before = PARTS.size();
+		std::cout << "Rank " << rank << " working on cell " << current_flat << " (row: " << current_row << ", col: " << current_col << ")\n";
+#endif
 
-	for (int i=0; i < NUM_PROCS; i++) {
-		if (rank == i) {
-                 	for (particle_t& p : PARTS) {
-				if (not_in_my_domain(p)) { 
-					std::cout << "Rank " << rank << " pid " << p.id << " has left domain! x: " << p.x << ", y: " << p.y << " MY_START: " << MY_START << " -> MY_END: " << MY_END << "\n";
+		// Neighboring Cells
+		for (int other_row=current_row-1; other_row <= current_row+1; other_row++) {
+		    for (int other_col=current_col-1; other_col <= current_col+1; other_col++) {
+
+			    if (other_row < 0 || other_col < 0 || other_row >= N_CELLS || other_col >=N_CELLS) {
+				    continue;
+			    }
+
+			    int other_flat;
+			    row_col_to_flat(other_row, other_col, other_flat);
+
+			    for (particle_t& p_outer : CELL_TO_PARTS[current_flat]) {
+			        for (particle_t& p_inner : CELL_TO_PARTS[other_flat]) {
+					if (p_outer.id != p_inner.id) {
+				            apply_force(p_outer, p_inner);
+					}
 				}
-         	        	
-			}
+			    }
+		    }
 		}
-		MPI_Barrier(MPI_COMM_WORLD);
-	}
-#endif
-
-	PARTS.erase(
-			std::remove_if(
-				PARTS.begin(),
-				PARTS.end(),
-				not_in_my_domain),
-			PARTS.end());
-#if DEBUG > 2
-	int after = PARTS.size();
-	if (before != after) {
-		std::cout << "Rank " << rank << " removed " << after - before << " particles!\n";
 	}
 
+	// Loop over all cells that ths rank is responsible for
+	// perform moves
+	// gather all for sending
+	
+	std::vector<particle_t> send;
 
+	for (int current_flat=MY_CELL_START; current_flat < MY_CELL_END; current_flat++) {
+		int current_row;
+		int current_col;
+
+		flat_to_row_col(current_flat, current_row, current_col);
+		std::vector<particle_t>& cell_parts = CELL_TO_PARTS[current_flat];
+
+		for (particle_t& p_outer : cell_parts) {
+			move(p_outer, SIZE);
+		}
+
+		std::move(cell_parts.begin(), cell_parts.end(), std::back_inserter(send));
+	}
+
+	// All ranks communicate their updated cell's particles
+	// two parts, first sending the counts
+	int send_count = send.size();
+	std::vector<int> recv_counts(NUM_PROCS);
+	std::vector<int> recv_disps(NUM_PROCS);
+
+	MPI_Allgather(&send_count, 1, MPI_INT, 
+			recv_counts.data(), 1, MPI_INT,
+			MPI_COMM_WORLD);
+
+	int total = 0;
 	for (int i=0; i < NUM_PROCS; i++) {
-		if (rank == i) {
-                 	for (particle_t& p : OTHER_LEFT_GHOSTS) {
-				std::cout << "Rank " << rank << " ghost from left - pid: " << p.id << " x=" << p.x << " nimd: " << not_in_my_domain(p) << "\n";
-			}
-
-                 	for (particle_t& p : OTHER_RIGHT_GHOSTS) {
-				std::cout << "Rank " << rank << " ghost from right - pid: " << p.id << " x=" << p.x << " nimd: " << not_in_my_domain(p) << "\n";
-			}
+		if (i == 0) {
+			recv_disps[0] = 0;
+		} else {
+			recv_disps[i] = recv_disps[i-1] + recv_counts[i-1];
 		}
 
-
-
-
-		MPI_Barrier(MPI_COMM_WORLD);
+		total += recv_counts[i];
 	}
 
-
-
-#endif
-
-	// Move from Ghosts to PARTS if it is inside domain
-	auto left_it = std::stable_partition(OTHER_LEFT_GHOSTS.begin(), OTHER_LEFT_GHOSTS.end(), not_in_my_domain);
-	auto right_it = std::stable_partition(OTHER_RIGHT_GHOSTS.begin(), OTHER_RIGHT_GHOSTS.end(), not_in_my_domain);
-
-#if DEBUG > 1
-	before = PARTS.size();
-#endif
-
-	PARTS.insert(PARTS.end(), std::make_move_iterator(left_it), std::make_move_iterator(OTHER_LEFT_GHOSTS.end()));
-
-#if DEBUG > 1
-	after = PARTS.size();
-	if (before != after) {
-		for (int i=before; i < after; i++) {
-			std::cout << "Rank " << rank << " got " << PARTS[i].id << " from the left!\n";
-		}
+	if (total != NUM_PARTS) {
+		std::cout << "HHJJ:SDJF:LKSJDF:   " << NUM_PARTS << " vs " << total << "\n";
 	}
 
-	before = PARTS.size();
-#endif
-
-	PARTS.insert(PARTS.end(), std::make_move_iterator(right_it), std::make_move_iterator(OTHER_RIGHT_GHOSTS.end()));
-
-#if DEBUG > 1
-	after = PARTS.size();
-	if (before != after) {
-		for (int i=before; i < after; i++) {
-			std::cout << "Rank " << rank << " got " << PARTS[i].id << " from the left!\n";
-		}
-	}
-
-	before = PARTS.size();
-	MPI_Barrier(MPI_COMM_WORLD);
-#endif
-
-	OTHER_LEFT_GHOSTS.erase(left_it, OTHER_LEFT_GHOSTS.end());
-	OTHER_RIGHT_GHOSTS.erase(right_it, OTHER_RIGHT_GHOSTS.end());
-
-
-	// Now should have everything we need communication wise
-
-
-	// Sort by Y dim so we can leverage the cutoff better
-        std::sort(PARTS.begin(), 
-		  PARTS.end(),
-		  [](const particle_t &a, const particle_t &b) {return a.y < b.y;});
-
-        std::sort(OTHER_LEFT_GHOSTS.begin(), 
-		  OTHER_LEFT_GHOSTS.end(),
-		  [](const particle_t &a, const particle_t &b) {return a.y < b.y;});
- 
-	std::sort(OTHER_RIGHT_GHOSTS.begin(), 
-		  OTHER_RIGHT_GHOSTS.end(),
-		  [](const particle_t &a, const particle_t &b) {return a.y < b.y;});
-
-	// Start computing interactions
-	for (particle_t& p_outer : PARTS) {
-
-	        // Owned parts interaction	
-		for (particle_t& p_inner : PARTS) {
-
-			if (p_outer.id == p_inner.id) {
-				continue;
-			} else if (p_inner.y > (p_outer.y + CUTOFF)) {
-				break;
-			} else if (p_inner.y < (p_outer.y - CUTOFF)) {
-				continue;
-			}
-
-			apply_force(p_outer, p_inner);
-		}
-
-
-	        // LEFT ghosts
-		for (particle_t& p_inner : OTHER_LEFT_GHOSTS) {
-			if (p_inner.y > (p_outer.y + CUTOFF)) {
-				break;
-			} else if (p_inner.y < (p_outer.y - CUTOFF)) {
-				continue;
-			}
-
-			apply_force(p_outer, p_inner);
-		}
-
-
-	        // RIGHT ghosts
-		for (particle_t& p_inner : OTHER_RIGHT_GHOSTS) {
-			if (p_inner.y > (p_outer.y + CUTOFF)) {
-				break;
-			} else if (p_inner.y < (p_outer.y - CUTOFF)) {
-				continue;
-			}
-
-			apply_force(p_outer, p_inner);
-		}
-	}
-
-	// Perform moves now that all PARTS
-	// have been updated
-	for (particle_t& p_outer : PARTS) {
-		move(p_outer, SIZE);
-	}
-
-    STEP++;
+	MPI_Allgatherv(send.data(), send_count, PARTICLE,
+		      parts, recv_counts.data(), recv_disps.data(), 
+		      PARTICLE, MPI_COMM_WORLD);
 }
+
+
 
 
 void gather_for_save(particle_t* parts, int num_parts, double size, int rank, int num_procs) {
@@ -406,41 +294,11 @@ void gather_for_save(particle_t* parts, int num_parts, double size, int rank, in
     // processor has an in-order view of all particles. That is, the array
     // parts is complete and sorted by particle id.
 
-    int my_count = PARTS.size();
-    std::vector<int> counts;
-    std::vector<int> disps;
-    std::vector<particle_t> recv;
-
     if (rank == 0) {
-	    counts.resize(NUM_PROCS);
-	    disps.resize(NUM_PROCS);
-            recv.resize(NUM_PARTS);
+        std::sort(parts,
+	          parts + NUM_PARTS,
+	          [](const particle_t &a, const particle_t &b) {return a.id < b.id;});
     }
-
-    MPI_Gather(&my_count, 1, MPI_INT, counts.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
-
-    if (rank == 0) {
-        int total_parts = 0;
-        for (int i = 0; i < NUM_PROCS; i++) {
-            disps[i] = total_parts;
-            total_parts += counts[i];
-
-	}
-
-	if (total_parts != NUM_PARTS) {
-		std::cout << "ISSUEEEEEE~~~!!!!!\n";
-	}
-   }
-
-
-    MPI_Gatherv(PARTS.data(), my_count, PARTICLE,
-                recv.data(), counts.data(), disps.data(), PARTICLE, 0, MPI_COMM_WORLD);
-
-
-    std::sort(recv.begin(), 
-	      recv.end(),
-	      [](const particle_t &a, const particle_t &b) {return a.id < b.id;});
-
-    std::move(recv.begin(), recv.end(), parts);
 }
+
 
