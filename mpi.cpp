@@ -15,6 +15,9 @@ float MY_LEFT_HALO;
 float MY_RIGHT_HALO;
 
 std::vector<particle_t> MY_PARTS;
+std::vector<particle_t> MY_NEW_PARTS;
+std::vector<particle_t> OTHER_LEFT_PARTS;
+std::vector<particle_t> OTHER_RIGHT_PARTS;
 
 
 
@@ -224,12 +227,37 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
 	}
 
 
+
+        // MOVE THE SHUFFLING OF MY_PARTS to now
+	// so that while that communication is goin
+	// we can move any non-in domain parts
+	// to the ghost list where they belong	
+
+	// Now the same for MY_PARTS and ghosts!
+	auto my_partition = std::stable_partition(
+			         MY_PARTS.begin(),
+				 MY_PARTS.end(),
+				 [](const particle_t& p) {return in_my_domain(p); });
+
+	// arbitrarily insert into right ghosts
+	OTHER_RIGHT_PARTS.clear();
+	OTHER_RIGHT_PARTS.insert(OTHER_RIGHT_PARTS.end(),
+		      	std::make_move_iterator(my_partition),
+			std::make_move_iterator(MY_PARTS.end()));
+
+
+        // remove	
+	MY_PARTS.erase(my_partition, MY_PARTS.end());
+
+	// Now wait
 	MPI_Waitall(count_req_count, count_reqs, MPI_STATUSES_IGNORE);
+
 
 	// Now I have the info about how many particles I will
 	// recieve from my left and right
-	std::vector<particle_t> other_right_parts(count_other_right_parts);
-	std::vector<particle_t> other_left_parts(count_other_left_parts);
+	int current_other_right_parts_size = OTHER_RIGHT_PARTS.size();
+	OTHER_RIGHT_PARTS.resize(current_other_right_parts_size + count_other_right_parts);
+	OTHER_LEFT_PARTS.resize(count_other_left_parts);
 
 	// Same pattern, get particles now
 
@@ -252,7 +280,7 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
 		std::cout << "Rank " << rank << " recieving " << count_other_right_parts << " other_right_parts to rank " << rank+1 << "\n";
 #endif
 
-		MPI_Irecv(other_right_parts.data(), count_other_right_parts, PARTICLE,
+		MPI_Irecv(OTHER_RIGHT_PARTS.data() + current_other_right_parts_size, count_other_right_parts, PARTICLE,
 			rank+1, // from my right
 			0, MPI_COMM_WORLD, &particle_reqs[particle_req_count++]);
 	}
@@ -278,75 +306,21 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
 		std::cout << "Rank " << rank << " recieving " << count_other_left_parts << " other_left_parts to rank " << rank-1 << "\n";
 #endif
 
-		MPI_Irecv(other_left_parts.data(), count_other_left_parts, PARTICLE,
+		MPI_Irecv(OTHER_LEFT_PARTS.data(), count_other_left_parts, PARTICLE,
 			rank-1, // from my left
 			0, MPI_COMM_WORLD, &particle_reqs[particle_req_count++]);
 	}
 
-	MPI_Waitall(particle_req_count, particle_reqs, MPI_STATUSES_IGNORE);
 
+	// OVERLAP COMPUTATION WHILE WE WAIT FOR 
+	// THE LARGER COMMUNICATIONS
+	// can start working on the particles
+	// that are already in our domain 
+	// right away
 	
-        // Need to manage particle ownership
-	
-	// partiton based on if any ghosts are
-	// in this ranks domain
-	auto left_partition = std::stable_partition(
-			         other_left_parts.begin(),
-				 other_left_parts.end(),
-				 [](const particle_t& p) {return !in_my_domain(p); });
 
-
-	auto right_partition = std::stable_partition(
-			         other_right_parts.begin(),
-				 other_right_parts.end(),
-				 [](const particle_t& p) {return !in_my_domain(p); });
-
-
-	// If they are, insert to MY_PARTS
-	MY_PARTS.insert(MY_PARTS.end(),
-			std::make_move_iterator(left_partition),
-			std::make_move_iterator(other_left_parts.end()));
-
-	MY_PARTS.insert(MY_PARTS.end(),
-			std::make_move_iterator(right_partition),
-			std::make_move_iterator(other_right_parts.end()));
-
-	// Remove from ghosts
-	other_left_parts.erase(left_partition, other_left_parts.end());
-	other_right_parts.erase(right_partition, other_right_parts.end());
-
-
-
-	// Now the same for MY_PARTS and ghosts!
-	
-	auto my_partition = std::stable_partition(
-			         MY_PARTS.begin(),
-				 MY_PARTS.end(),
-				 [](const particle_t& p) {return in_my_domain(p); });
-
-	// arbitrarily insert into right ghosts
-	other_right_parts.insert(other_right_parts.end(),
-		      	std::make_move_iterator(my_partition),
-			std::make_move_iterator(MY_PARTS.end()));
-
-
-        // remove	
-	MY_PARTS.erase(my_partition, MY_PARTS.end());
-
-	
-	// FINALLY ready for calculations now that ownership is sorted
-	// Sort by Y so that I can threshold what needs to be computed
-	
-        std::sort(MY_PARTS.begin(), 
+	std::sort(MY_PARTS.begin(), 
 		  MY_PARTS.end(),
-		  [](const particle_t &a, const particle_t &b) {return a.y < b.y;});
-
-        std::sort(other_left_parts.begin(), 
-		  other_left_parts.end(),
-		  [](const particle_t &a, const particle_t &b) {return a.y < b.y;});
- 
-	std::sort(other_right_parts.begin(), 
-		  other_right_parts.end(),
 		  [](const particle_t &a, const particle_t &b) {return a.y < b.y;});
 
 	for (particle_t& p_outer : MY_PARTS) {
@@ -365,10 +339,74 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
 
 			apply_force(p_outer, p_inner);
 		}
+	}
 
+
+
+	MPI_Waitall(particle_req_count, particle_reqs, MPI_STATUSES_IGNORE);
+
+	
+        // Need to manage particle ownership
+	
+	// partiton based on if any ghosts are
+	// in this ranks domain
+	auto left_partition = std::stable_partition(
+			         OTHER_LEFT_PARTS.begin(),
+				 OTHER_LEFT_PARTS.end(),
+				 [](const particle_t& p) {return !in_my_domain(p); });
+
+
+	auto right_partition = std::stable_partition(
+			         OTHER_RIGHT_PARTS.begin(),
+				 OTHER_RIGHT_PARTS.end(),
+				 [](const particle_t& p) {return !in_my_domain(p); });
+
+
+	// If they are, insert to MY_NEW_PARTS
+	MY_NEW_PARTS.clear();
+	MY_NEW_PARTS.insert(MY_NEW_PARTS.end(),
+			std::make_move_iterator(left_partition),
+			std::make_move_iterator(OTHER_LEFT_PARTS.end()));
+
+	MY_NEW_PARTS.insert(MY_NEW_PARTS.end(),
+			std::make_move_iterator(right_partition),
+			std::make_move_iterator(OTHER_RIGHT_PARTS.end()));
+
+	// Remove from ghosts
+	OTHER_LEFT_PARTS.erase(left_partition, OTHER_LEFT_PARTS.end());
+	OTHER_RIGHT_PARTS.erase(right_partition, OTHER_RIGHT_PARTS.end());
+
+
+	// FINALLY ready for calculations now that ownership is sorted
+	// Sort by Y so that I can threshold what needs to be computed
+	std::sort(MY_NEW_PARTS.begin(), 
+		  MY_NEW_PARTS.end(),
+		  [](const particle_t &a, const particle_t &b) {return a.y < b.y;});
+
+        std::sort(OTHER_LEFT_PARTS.begin(), 
+		  OTHER_LEFT_PARTS.end(),
+		  [](const particle_t &a, const particle_t &b) {return a.y < b.y;});
+ 
+	std::sort(OTHER_RIGHT_PARTS.begin(), 
+		  OTHER_RIGHT_PARTS.end(),
+		  [](const particle_t &a, const particle_t &b) {return a.y < b.y;});
+
+
+	for (particle_t& p_outer : MY_PARTS) {
+
+		// MY_NEW_PARTS
+		for (particle_t& p_inner : MY_NEW_PARTS) {
+			if (p_inner.y > (p_outer.y + CUTOFF)) {
+				break;
+			} else if (p_inner.y < (p_outer.y - CUTOFF)) {
+				continue;
+			}
+
+			apply_force(p_outer, p_inner);
+		}
 
 	        // LEFT ghosts
-		for (particle_t& p_inner : other_left_parts) {
+		for (particle_t& p_inner : OTHER_LEFT_PARTS) {
 			if (p_inner.y > (p_outer.y + CUTOFF)) {
 				break;
 			} else if (p_inner.y < (p_outer.y - CUTOFF)) {
@@ -380,7 +418,7 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
 
 
 	        // RIGHT ghosts
-		for (particle_t& p_inner : other_right_parts) {
+		for (particle_t& p_inner : OTHER_RIGHT_PARTS) {
 			if (p_inner.y > (p_outer.y + CUTOFF)) {
 				break;
 			} else if (p_inner.y < (p_outer.y - CUTOFF)) {
@@ -390,6 +428,66 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
 			apply_force(p_outer, p_inner);
 		}
 	}
+
+
+	// MY_NEW_PARTS
+	//    hasn't had any forces applied yet
+	for (particle_t& p_outer : MY_NEW_PARTS) {
+		p_outer.ax = p_outer.ay = 0; 
+
+		// MY_PARTS
+		for (particle_t& p_inner : MY_PARTS) {
+			if (p_inner.y > (p_outer.y + CUTOFF)) {
+				break;
+			} else if (p_inner.y < (p_outer.y - CUTOFF)) {
+				continue;
+			}
+
+			apply_force(p_outer, p_inner);
+		}
+
+		// MY_NEW_PARTS
+		for (particle_t& p_inner : MY_NEW_PARTS) {
+			if (p_outer.id == p_inner.id) {
+				continue;
+			} else if (p_inner.y > (p_outer.y + CUTOFF)) {
+				break;
+			} else if (p_inner.y < (p_outer.y - CUTOFF)) {
+				continue;
+			}
+
+			apply_force(p_outer, p_inner);
+		}
+
+	        // LEFT ghosts
+		for (particle_t& p_inner : OTHER_LEFT_PARTS) {
+			if (p_inner.y > (p_outer.y + CUTOFF)) {
+				break;
+			} else if (p_inner.y < (p_outer.y - CUTOFF)) {
+				continue;
+			}
+
+			apply_force(p_outer, p_inner);
+		}
+
+
+	        // RIGHT ghosts
+		for (particle_t& p_inner : OTHER_RIGHT_PARTS) {
+			if (p_inner.y > (p_outer.y + CUTOFF)) {
+				break;
+			} else if (p_inner.y < (p_outer.y - CUTOFF)) {
+				continue;
+			}
+
+			apply_force(p_outer, p_inner);
+		}
+	}
+
+
+	// Move MY_NEW_PARTS in with MY_PARTS
+	MY_PARTS.insert(MY_PARTS.end(),
+		      	std::make_move_iterator(MY_NEW_PARTS.begin()),
+			std::make_move_iterator(MY_NEW_PARTS.end()));
 
 	// Perform moves now that all PARTS
 	// have been updated
