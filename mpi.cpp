@@ -60,6 +60,9 @@ double sg_box_dy;
 // Initialize a rank container
 rank_container mpi_rank;
 
+// Define a vector to store the start index and end index for each rank
+std::vector<int> start_idx, end_idx;
+
 /*
 // Create some booleans to represent rank locations
 bool mpi_left_edge = (mpi_rank.x1 == 0);                                                    // 1=Left
@@ -82,8 +85,8 @@ void init_simulation(particle_t* parts, int num_parts, double size, int rank, in
     bool two_nodes = (num_procs > 64);
 
     // Define global MPI grid properties
-    num_mpi_grid_x = 3;                                         // MPI grid boxes in x-direction
-    num_mpi_grid_y = two_nodes ? 16 : 3;                        // MPI grid boxes in y-direction
+    num_mpi_grid_x = 8;                                         // MPI grid boxes in x-direction
+    num_mpi_grid_y = two_nodes ? 16 : 8;                        // MPI grid boxes in y-direction
     mpi_grid_dx = size / num_mpi_grid_x;
     mpi_grid_dy = size / num_mpi_grid_y;
 
@@ -106,6 +109,24 @@ void init_simulation(particle_t* parts, int num_parts, double size, int rank, in
     // Resize the sub grid based on the global properties
     mpi_rank.sub_grid.resize(num_sg_box_x, std::vector<particle_container>(num_sg_box_y));
 
+    // Allocate memory for the indicies
+    start_idx.resize(num_procs);
+    end_idx.resize(num_procs);
+
+    if (rank == 0) {
+        // Compute the indicies for each rank
+        int n_particles_per_rank = num_parts / num_procs;
+        int current_start_idx = 0;
+
+        for (int rank_idx = 0; rank_idx < num_procs; rank_idx++){
+            start_idx[rank_idx] = current_start_idx;
+            int n_local_particles = n_particles_per_rank + (rank_idx < (num_parts % num_procs) ? 1 : 0);
+            end_idx[rank_idx] = (rank_idx == num_procs - 1) ? num_parts : start_idx[rank_idx] + n_local_particles;
+            current_start_idx = end_idx[rank_idx] + 1;
+        }
+    }
+    
+    /*
     // Define the MPI communication variables
     std::vector<int> send_counts(num_procs, 0);      // The number of particles to send to each rank
     std::vector<int> displ(num_procs, 0);           // The start index of the particle
@@ -159,7 +180,6 @@ void init_simulation(particle_t* parts, int num_parts, double size, int rank, in
     MPI_Scatterv(send_buf.data(), send_counts.data(), displ.data(), PARTICLE,
                  mpi_rank.particle_list.data(), num_particles_on_rank, PARTICLE, 0, MPI_COMM_WORLD);
     
-    /*
     // Shape the ghost particle grids based on the position of the rank in the MPI grid
     if (mpi_grid_corner_1 || mpi_grid_corner_2 || mpi_grid_corner_3 || mpi_grid_corner_4) {
         // Shape the ghost grid for corner ranks (+1 col, +1 row)
@@ -269,12 +289,14 @@ void send_recv_particles(std::vector<std::vector<particle_t>>& send_buf,
         
         // Sendrecv the size of the buffer with the destination rank.
         MPI_Sendrecv(&send_size, 1, MPI_INT, dest, i,
-                     &recv_size, 1, MPI_INT, dest, inv_tag,
-                     MPI_COMM_WORLD, &status);
+                    &recv_size, 1, MPI_INT, dest, inv_tag,
+                    MPI_COMM_WORLD, &status);
 
         if (rank == 0) {
-            std::cout << "Working before allocating memory to receive buffer, rank " << rank << std::endl;
+            std::cout << "Working before allocating memory to receive buffer" << std::endl;
         }
+
+        //MPI_Barrier(MPI_COMM_WORLD);
                  
         // Allocate memory for the receive buffer based on the receive counts
         recv_buf[i - 1].resize(recv_size);
@@ -284,13 +306,12 @@ void send_recv_particles(std::vector<std::vector<particle_t>>& send_buf,
         }
                  
         // Sendrecv the buffer with the destination rank
-        MPI_Sendrecv(send_buf[i - 1].data(), send_size, PARTICLE, dest, i,
-                     recv_buf[i - 1].data(), recv_size, PARTICLE, dest, inv_tag,
-                     MPI_COMM_WORLD, &status);
-        
-        
-        
+        MPI_Sendrecv(send_buf[i - 1].data(), send_size, PARTICLE, dest, i+100,
+            recv_buf[i - 1].data(), recv_size, PARTICLE, dest, inv_tag+100,
+            MPI_COMM_WORLD, &status);
 
+        
+        
         if ((rank == 0) && (i == 1)) {
             std::cout << "Completed sendrecv" << std::endl;
         } 
@@ -365,10 +386,12 @@ void update_mpi_particle_list(int rank) {
     if (rank == 0) {
         std::cout << "working before sendrecv particles" << std::endl;
     }
-    MPI_Barrier(MPI_COMM_WORLD);
+
     // Perform MPI communications to send and receive particles
     send_recv_particles(send_buf, recv_buf, rank);
+
     MPI_Barrier(MPI_COMM_WORLD);
+
     if (rank == 0) {
         std::cout << "Before allocating memory for particle list based on receive buffer" << std::endl;
     }
@@ -378,7 +401,9 @@ void update_mpi_particle_list(int rank) {
     for (const auto& buf : recv_buf) {
         total_recv_size += buf.size();
     }
-    mpi_rank.particle_list.reserve(mpi_rank.particle_list.size() + total_recv_size);
+
+    size_t old_size = mpi_rank.particle_list.size();
+    mpi_rank.particle_list.resize(old_size + total_recv_size);
 
     if (rank == 0) {
         std::cout << "Before moving buffers into the particle list" << std::endl;
@@ -386,17 +411,20 @@ void update_mpi_particle_list(int rank) {
 
     // Move the buffers into the particle list to avoid unecessary copies
     for (auto& buf : recv_buf){
-        mpi_rank.particle_list.insert(mpi_rank.particle_list.end(),
-                                      std::make_move_iterator(buf.begin()),
-                                      std::make_move_iterator(buf.end()));
+        for (auto& particle : buf) {
+            mpi_rank.particle_list[old_size++] = std::move(particle);
+        }
+        buf.clear();
     }
+
+    //mpi_rank.particle_list.shrink_to_fit();
 }
 
 //=============================================
 // Function For Updating the MPI rank sub grid
 //=============================================
 
-void update_sub_grid() {
+void update_sub_grid(int rank) {
     
     // Clear the sub grid 
     for (int i = 0; i < num_sg_box_x; i++) {
@@ -405,15 +433,23 @@ void update_sub_grid() {
         }
     }
 
+    if (rank == 0) {
+        std::cout << "Working after clearing particles from sub grid" << std::endl;
+    }
+
     // Loop through all of the particles in the list and assign them to a sub grid box
-    for (const auto& particle : mpi_rank.particle_list) {
+    for (size_t i = 0; i < mpi_rank.particle_list.size(); ++i) {
 
         // Determine the sub grid xy-location
-        int particle_xi = std::floor((particle.x - mpi_rank.x1) * sg_box_dx);
-        int particle_yj = std::floor((particle.y - mpi_rank.y1) * sg_box_dy);
+        int particle_xi = std::floor((mpi_rank.particle_list[i].x - mpi_rank.x1) * sg_box_dx);
+        int particle_yj = std::floor((mpi_rank.particle_list[i].y - mpi_rank.y1) * sg_box_dy);
 
         // Assign particle to sub grid box
-        mpi_rank.sub_grid[particle_xi][particle_yj].particles.push_back(particle);
+        mpi_rank.sub_grid[particle_xi][particle_yj].particles.push_back(mpi_rank.particle_list[i]);
+    }
+
+    if (rank == 0) {
+        std::cout << "Working after assigning particles to sub grid boxes" << std::endl;
     }
 }
 
@@ -1068,16 +1104,29 @@ void apply_force(particle_t& particle, particle_t& neighbor) {
 }
 
 // Function to determine which particles to evaluate against.
-void check_nearby_containers(particle_t &particle) {
-
+void check_nearby_containers(particle_t &particle, int rank) {
+    
+    // Determine the sub grid xy-location
+    int particle_xi = std::floor((particle.x - mpi_rank.x1) * sg_box_dx);
+    int particle_yj = std::floor((particle.y - mpi_rank.y1) * sg_box_dy);
+    
     // Loop through the 3x3 grid of containers centered on the current particle.
     for (int dx = -1; dx <= 1; dx++) {
         for (int dy = -1; dy <= 1; dy++) {
             // Define the current container to be evaluated
-            int cx = particle.x + dx;
-            int cy = particle.y + dy;
+            int cx = particle_xi + dx;
+            int cy = particle_yj + dy;
+
+            if ((cx < 0) || (cy < 0) || (cx >= num_sg_box_x - 1) || (cy >= num_sg_box_y - 1)) {
+                continue;
+            }
 
             std::vector<particle_t>& neighbor_particles =mpi_rank.sub_grid[cx][cy].particles;
+
+            if (neighbor_particles.empty()) {
+                continue;
+            }
+
 
             // Loop through the particles in the container
             for (auto &neighbor : neighbor_particles) {
@@ -1207,31 +1256,146 @@ void move(particle_t& p, double size) {
     }
 }
 
+void distribute_particles_to_ranks(particle_t* parts, int num_parts, double size, int rank, int num_procs){
+
+    // Clear the local particle list from the previous iteration.
+    mpi_rank.particle_list.clear();
+    
+    // Create a vector which contains the particles arbitrarily assigned to this rank.
+    std::vector<particle_t> pre_assigned_particles(parts + start_idx[rank], parts + end_idx[rank]);
+
+    // Create send buffers for each rank
+    std::vector<std::vector<particle_t>> send_buf(num_procs);
+
+    // Have each rank loop through their index of particles to compute the index of the particle
+    for (auto& p : pre_assigned_particles) {
+        int particle_xi = std::floor((p.x / size) * num_mpi_grid_x);
+        int particle_yj = std::floor((p.y / size) * num_mpi_grid_y);
+
+        // Compute which rank the particle belongs in
+        int particle_rank = particle_xi + particle_yj * num_mpi_grid_x;
+
+        // Store the particle in the appropriate send buffer
+        send_buf[particle_rank].push_back(p);
+    }
+
+    // Initialize communication variables
+    std::vector<int> send_counts(num_procs, 0);
+    std::vector<int> recv_counts(num_procs, 0);
+    std::vector<int> send_displs(num_procs, 0);
+    std::vector<int> recv_displs(num_procs, 0);
+
+    // Compute send counts based on pre-assigned particles
+    for (int i = 0; i < num_procs; i++) {
+        send_counts[i] = send_buf[i].size();
+    }
+
+    // Communicate the counts to all ranks.
+    MPI_Alltoall(send_counts.data(), 1, MPI_INT, recv_counts.data(), 1, MPI_INT, MPI_COMM_WORLD);
+    
+    // Compute total receive size and displacements
+    int total_recv_size = 0;
+    for (int i = 0; i < num_procs; i++) {
+        recv_displs[i] = total_recv_size;
+        total_recv_size += recv_counts[i];
+    }
+
+    // Pack the send buffer in rank order
+    std::vector<particle_t> local_send_buf;
+    for (int i = 0; i < num_procs; i++) {
+        local_send_buf.insert(local_send_buf.end(),
+                              send_buf[i].begin(),
+                              send_buf[i].end()
+        );
+    }
+
+    // Initialize the receive buffer
+    std::vector<particle_t> recv_buf(total_recv_size);
+
+    // Compute the displacements
+    send_displs[0] = 0;
+    for (int i = 1; i < num_procs; i++) {
+        send_displs[i] = send_displs[i - 1] + send_counts[i - 1];
+    }
+
+    // Communicate the particle data to all of the ranks
+    MPI_Alltoallv(local_send_buf.data(), send_counts.data(), send_displs.data(), PARTICLE,
+                  recv_buf.data(), recv_counts.data(), recv_displs.data(), PARTICLE,
+                  MPI_COMM_WORLD);
+
+    // Update the particle list for the rank
+    mpi_rank.particle_list = std::move(recv_buf);
+
+    // Sync all of the ranks before continuing.
+    MPI_Barrier(MPI_COMM_WORLD);
+}
+
 void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, int num_procs) {
 
+    if (rank == 0) {
+        std::cout << "Starting a new simulation step" << std::endl;
+    }
+
+    // Determine which particles are assigned to the local rank
+    /*
+    1. Pre-computed indices for each rank determine which rank handles which particles
+    2. Each rank computes the assigned rank of the pre-determined index of particles
+    3. The particles are distributed to their associated rank and the particle list is updated
+    */
+    distribute_particles_to_ranks(parts, num_parts, size, rank, num_procs);
+
     // Update the sub grid
-    update_sub_grid();
+    /*
+    1. Clear each sub grid box in the local mpi rank from all particles from the previous iteration
+    2. Loop through all of the particles contained on the rank and assign them to sub grid boxes
+    */
+    update_sub_grid(rank);
 
     // Update ghost grid
+    // Note: This function is skipped for troubleshooting
+    /*
+    1. Clears the ghost grid of the local rank from all particles from the previous iteration
+    2. Packs the ghost grid particles from the left/right neighbors
+    3. Sends the ghost grid particles from the left/right neighbors
+    4. Unpacks the received particles and updates them into the local ranks ghost grid
+    4. Packs the ghost grid particles from the top/bottom neighbors
+    5. Sends the ghost grid particles from the top/bottom neighbors
+    6. Unpacks the received particles and updates them into the locla ranks ghost grid
+    */
     //update_ghost_grid();
+
+
     if (rank == 0) {
         std::cout << "Working before computing forces" << std::endl;
     }
+
+    MPI_Barrier(MPI_COMM_WORLD);
     
     // Loop through all of the particles in the rank and compute the forces
-    for (particle_t& particle : mpi_rank.particle_list) {
+    /*
+    1. Loop through all of the particles contained on the current rank
+    2. Loop through a 3x3 section of sub grid containers centered on the current particle
+    3. Compute the forces for all of the particle interactions less than the cutoff distance.
+    */
+    for (size_t i = 0; i < mpi_rank.particle_list.size(); ++i) {
 
         // Reset accelerations to avoid accumulation error
-        particle.ax = particle.ay = 0;
+        mpi_rank.particle_list[i].ax = mpi_rank.particle_list[i].ay = 0;
 
         // Check particles within one cutoff distance
-        check_nearby_containers(particle);
+        check_nearby_containers(mpi_rank.particle_list[i], rank);
     }
     if (rank == 0) {
         std::cout << "Working before moving particles" << std::endl;
     }
+
+    MPI_Barrier(MPI_COMM_WORLD);
     
     // Move Particles after the forces have been computed for all particles
+    /*
+    1. Update all of the particle positions on the local rank only after all of the forces have been
+       calculated
+    */
     for (int i = 0; i < mpi_rank.particle_list.size(); ++i) {
         move(mpi_rank.particle_list[i], size);
     }
@@ -1240,8 +1404,17 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
         std::cout << "Working before updating particles moving between ranks" << std::endl;
     }
 
+    MPI_Barrier(MPI_COMM_WORLD);
+
     // Update the particles in the MPI grid box particle list
-    update_mpi_particle_list(rank);
+    // Note: This function is deprecated
+    /*
+    1. Check if any of the particles are outside of the local ranks domain after moving
+    2. Send the particles to the appropriate rank based on their updated position
+    4. Remove the affected particles from the list of particles contained on the local rank
+    3. Add the received particles from other ranks to the list of particles on the local rank
+    */
+    //update_mpi_particle_list(rank);
 
     if (rank == 0) {
         std::cout << "Completed simulation step" << std::endl;
