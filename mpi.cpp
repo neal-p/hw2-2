@@ -74,15 +74,18 @@ void move(particle_t& p, double size) {
 // if a partcle belongs to this rank
 // or this rank's halo region
 
-bool in_my_domain(particle_t& p) {
+inline
+bool in_my_domain(const particle_t& p) {
 	return p.x <= MY_END && p.x > MY_START;
 }
 
-bool in_my_right_halo(particle_t& p) {
+inline
+bool in_my_right_halo(const particle_t& p) {
 	return p.x >= MY_RIGHT_HALO;
 }
 
-bool in_my_left_halo(particle_t& p) {
+inline
+bool in_my_left_halo(const particle_t& p) {
 	return p.x <= MY_LEFT_HALO;
 }
 
@@ -282,128 +285,56 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
 
 	MPI_Waitall(particle_req_count, particle_reqs, MPI_STATUSES_IGNORE);
 
-	MPI_Barrier(MPI_COMM_WORLD);
-
-
-	// At this point I should have everything I need
-	// to calculate forces and do movements
 	
-	// But, need to be careful about particle ownership
-	// check if any of the ghosts I was passed have actually
-	// left their rank's domain and come into mine
-
-        // do this the stupid way first, then the C++ way	
-	std::vector<int> other_left_parts_to_delete;
-
-        int left_ghost_idx = 0;	
-	for (particle_t& p : other_left_parts) {
-
-#if DEBUG > 3
-		std::cout << "Rank " << rank << " got pid: " << p.id << " (" << p.x << ") from rank " << rank-1 << "\n";
-#endif
-
-		if (in_my_domain(p)) {
-#if DEBUG > 1
-			std::cout << "Rank " << rank << " got pid: " << p.id << " from rank " << rank-1 << " and it has entered rank " << rank << "'s domain\n";
-#endif
-			other_left_parts_to_delete.push_back(left_ghost_idx);
-		}
-
-		left_ghost_idx++;
-	}
+        // Need to manage particle ownership
 	
-	MPI_Barrier(MPI_COMM_WORLD);
-	
-
-	std::vector<int> other_right_parts_to_delete;
-
-        int right_ghost_idx = 0;	
-	for (particle_t& p : other_right_parts) {
-#if DEBUG > 3
-		std::cout << "Rank " << rank << " got pid: " << p.id << " (" << p.x << ") from rank " << rank+1 << "\n";
-#endif
-
-		if (in_my_domain(p)) {
-#if DEBUG > 1
-			std::cout << "Rank " << rank << " got pid: " << p.id << " from rank " << rank+1 << " and it has entered rank " << rank << "'s domain\n";
-#endif
-			other_right_parts_to_delete.push_back(right_ghost_idx);
-		}
-
-		right_ghost_idx++;
-	}
+	// partiton based on if any ghosts are
+	// in this ranks domain
+	auto left_partition = std::stable_partition(
+			         other_left_parts.begin(),
+				 other_left_parts.end(),
+				 [](const particle_t& p) {return !in_my_domain(p); });
 
 
-	MPI_Barrier(MPI_COMM_WORLD);
+	auto right_partition = std::stable_partition(
+			         other_right_parts.begin(),
+				 other_right_parts.end(),
+				 [](const particle_t& p) {return !in_my_domain(p); });
 
 
-	std::sort(other_right_parts_to_delete.begin(), other_right_parts_to_delete.end(), std::greater<int>());
-	std::sort(other_left_parts_to_delete.begin(), other_left_parts_to_delete.end(), std::greater<int>());
+	// If they are, insert to MY_PARTS
+	MY_PARTS.insert(MY_PARTS.end(),
+			std::make_move_iterator(left_partition),
+			std::make_move_iterator(other_left_parts.end()));
 
+	MY_PARTS.insert(MY_PARTS.end(),
+			std::make_move_iterator(right_partition),
+			std::make_move_iterator(other_right_parts.end()));
 
-	// Add to MY_PARTS, remove from ghosts
-	for (int idx : other_left_parts_to_delete) {
-#if DEBUG > 1
-		std::cout << "Rank " << rank << " adding pid: " << other_left_parts[idx].id << " to MY_PARTS from left\n";
-#endif
+	// Remove from ghosts
+	other_left_parts.erase(left_partition, other_left_parts.end());
+	other_right_parts.erase(right_partition, other_right_parts.end());
 
-		MY_PARTS.push_back(other_left_parts[idx]);
-		other_left_parts.erase(other_left_parts.begin() + idx);
-	}
-	
-	for (int idx : other_right_parts_to_delete) {
-
-#if DEBUG > 1
-		std::cout << "Rank " << rank << " adding pid: " << other_right_parts[idx].id << " to MY_PARTS from right\n";
-#endif
-
-
-		MY_PARTS.push_back(other_right_parts[idx]);
-		other_right_parts.erase(other_right_parts.begin() + idx);
-	}
-
-
-
-	MPI_Barrier(MPI_COMM_WORLD);
 
 
 	// Now the same for MY_PARTS and ghosts!
 	
-	std::vector<int> my_parts_to_delete;
-	int part_idx=0; 
+	auto my_partition = std::stable_partition(
+			         MY_PARTS.begin(),
+				 MY_PARTS.end(),
+				 [](const particle_t& p) {return in_my_domain(p); });
 
-	for (particle_t& p : MY_PARTS) {
-		if (!in_my_domain(p)) {
-#if DEBUG > 1
-			std::cout << "Rank " << rank << " has pid: " << p.id << " but it is outside its domain (" << p.x << "), releasing ownership\n";
-#endif
-			my_parts_to_delete.push_back(part_idx);
-		}
-		part_idx ++;
-	}
+	// arbitrarily insert into right ghosts
+	other_right_parts.insert(other_right_parts.end(),
+		      	std::make_move_iterator(my_partition),
+			std::make_move_iterator(MY_PARTS.end()));
 
 
+        // remove	
+	MY_PARTS.erase(my_partition, MY_PARTS.end());
 
-	std::sort(my_parts_to_delete.begin(), my_parts_to_delete.end(), std::greater<int>());
-
-	for (int idx : my_parts_to_delete) {
-#if DEBUG > 1
-		std::cout << "Rank " << rank << " deleting pid: " << MY_PARTS[idx].id << " from MY_PARTS\n";
-#endif
-		// arbitrarily add to right ghost list
-		// we need it to still interact with other
-		// particles, we just are no longer responsible
-		// for moving in this step
-		other_right_parts.push_back(MY_PARTS[idx]);
-		MY_PARTS.erase(MY_PARTS.begin() + idx);
-	}
-
-	MPI_Barrier(MPI_COMM_WORLD);
-
-
-	// FINALLY ready for calculations now that ownership is sorted
 	
-
+	// FINALLY ready for calculations now that ownership is sorted
 	// Sort by Y so that I can threshold what needs to be computed
 	
         std::sort(MY_PARTS.begin(), 
@@ -466,12 +397,11 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
 		move(p_outer, size);
 	}
 
-//#if DEBUG > 0
+#if DEBUG > 0
 	if (rank == 0) {
 	    std::cout << "END OF STEP\n";
 	}
-	MPI_Barrier(MPI_COMM_WORLD);
-//#endif
+#endif
 
 }
 
